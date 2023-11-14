@@ -94,46 +94,40 @@ void convnet::_Head::process_(const Eigen::MatrixXf& input, Eigen::VectorXf& out
 }
 
 convnet::ConvNet::ConvNet(const int channels, const std::vector<int>& dilations, const bool batchnorm,
-                          const std::string activation, std::vector<float>& params)
-: ConvNet(TARGET_DSP_LOUDNESS, channels, dilations, batchnorm, activation, params)
-{
-}
-
-convnet::ConvNet::ConvNet(const double loudness, const int channels, const std::vector<int>& dilations,
-                          const bool batchnorm, const std::string activation, std::vector<float>& params)
-: Buffer(loudness, *std::max_element(dilations.begin(), dilations.end()))
+                          const std::string activation, std::vector<float>& params, const double expected_sample_rate)
+: Buffer(*std::max_element(dilations.begin(), dilations.end()), expected_sample_rate)
 {
   this->_verify_params(channels, dilations, batchnorm, params.size());
   this->_blocks.resize(dilations.size());
   std::vector<float>::iterator it = params.begin();
-  for (int i = 0; i < dilations.size(); i++)
+  for (size_t i = 0; i < dilations.size(); i++)
     this->_blocks[i].set_params_(i == 0 ? 1 : channels, channels, dilations[i], batchnorm, activation, it);
   this->_block_vals.resize(this->_blocks.size() + 1);
+  for (auto& matrix : this->_block_vals)
+    matrix.setZero();
+  std::fill(this->_input_buffer.begin(), this->_input_buffer.end(), 0.0f);
   this->_head = _Head(channels, it);
   if (it != params.end())
-    throw std::runtime_error("Didn't touch all the params when initializing wavenet");
-  this->_reset_anti_pop_();
+    throw std::runtime_error("Didn't touch all the params when initializing ConvNet");
 }
 
-void convnet::ConvNet::_process_core_()
+void convnet::ConvNet::process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames)
+
 {
-  this->_update_buffers_();
+  this->_update_buffers_(input, num_frames);
   // Main computation!
   const long i_start = this->_input_buffer_offset;
-  const long num_frames = this->_input_post_gain.size();
   const long i_end = i_start + num_frames;
   // TODO one unnecessary copy :/ #speed
   for (auto i = i_start; i < i_end; i++)
     this->_block_vals[0](0, i) = this->_input_buffer[i];
-  for (auto i = 0; i < this->_blocks.size(); i++)
+  for (size_t i = 0; i < this->_blocks.size(); i++)
     this->_blocks[i].process_(this->_block_vals[i], this->_block_vals[i + 1], i_start, i_end);
   // TODO clean up this allocation
   this->_head.process_(this->_block_vals[this->_blocks.size()], this->_head_output, i_start, i_end);
   // Copy to required output array (TODO tighten this up)
   for (int s = 0; s < num_frames; s++)
-    this->_core_dsp_output[s] = this->_head_output(s);
-  // Apply anti-pop
-  this->_anti_pop_();
+    output[s] = this->_head_output(s);
 }
 
 void convnet::ConvNet::_verify_params(const int channels, const std::vector<int>& dilations, const bool batchnorm,
@@ -142,13 +136,26 @@ void convnet::ConvNet::_verify_params(const int channels, const std::vector<int>
   // TODO
 }
 
-void convnet::ConvNet::_update_buffers_()
+void convnet::ConvNet::_update_buffers_(NAM_SAMPLE* input, const int num_frames)
 {
-  this->Buffer::_update_buffers_();
-  const long buffer_size = this->_input_buffer.size();
-  this->_block_vals[0].resize(1, buffer_size);
-  for (long i = 1; i < this->_block_vals.size(); i++)
+  this->Buffer::_update_buffers_(input, num_frames);
+
+  const size_t buffer_size = this->_input_buffer.size();
+
+  if (this->_block_vals[0].rows() != 1 || this->_block_vals[0].cols() != buffer_size)
+  {
+    this->_block_vals[0].resize(1, buffer_size);
+    this->_block_vals[0].setZero();
+  }
+
+  for (size_t i = 1; i < this->_block_vals.size(); i++)
+  {
+    if (this->_block_vals[i].rows() == this->_blocks[i - 1].get_out_channels()
+        && this->_block_vals[i].cols() == buffer_size)
+      continue; // Already has correct size
     this->_block_vals[i].resize(this->_blocks[i - 1].get_out_channels(), buffer_size);
+    this->_block_vals[i].setZero();
+  }
 }
 
 void convnet::ConvNet::_rewind_buffers_()
@@ -157,7 +164,7 @@ void convnet::ConvNet::_rewind_buffers_()
   // resets the offset index
   // The last _block_vals is the output of the last block and doesn't need to be
   // rewound.
-  for (long k = 0; k < this->_block_vals.size() - 1; k++)
+  for (size_t k = 0; k < this->_block_vals.size() - 1; k++)
   {
     // We actually don't need to pull back a lot...just as far as the first
     // input sample would grab from dilation
@@ -169,28 +176,4 @@ void convnet::ConvNet::_rewind_buffers_()
   }
   // Now we can do the rest of the rewind
   this->Buffer::_rewind_buffers_();
-}
-
-void convnet::ConvNet::_anti_pop_()
-{
-  if (this->_anti_pop_countdown >= this->_anti_pop_ramp)
-    return;
-  const float slope = 1.0f / float(this->_anti_pop_ramp);
-  for (int i = 0; i < this->_core_dsp_output.size(); i++)
-  {
-    if (this->_anti_pop_countdown >= this->_anti_pop_ramp)
-      break;
-    const float gain = std::max(slope * float(this->_anti_pop_countdown), float(0.0));
-    this->_core_dsp_output[i] *= gain;
-    this->_anti_pop_countdown++;
-  }
-}
-
-void convnet::ConvNet::_reset_anti_pop_()
-{
-  // You need the "real" receptive field, not the buffers.
-  long receptive_field = 1;
-  for (int i = 0; i < this->_blocks.size(); i++)
-    receptive_field += this->_blocks[i].conv.get_dilation();
-  this->_anti_pop_countdown = -receptive_field;
 }

@@ -16,29 +16,31 @@
 
 constexpr const long _INPUT_BUFFER_SAFETY_FACTOR = 32;
 
-DSP::DSP()
-: mLoudness(TARGET_DSP_LOUDNESS)
-, mNormalizeOutputLoudness(false)
-, _stale_params(true)
+DSP::DSP(const double expected_sample_rate)
+: mExpectedSampleRate(expected_sample_rate)
 {
 }
 
-DSP::DSP(const double loudness)
-: mLoudness(loudness)
-, mNormalizeOutputLoudness(false)
-, _stale_params(true)
+void DSP::process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames)
 {
+  // Default implementation is the null operation
+  for (size_t i = 0; i < num_frames; i++)
+    output[i] = input[i];
 }
 
-void DSP::process(sample** inputs, sample** outputs, const int num_channels, const int num_frames,
-                  const double input_gain, const double output_gain,
-                  const std::unordered_map<std::string, double>& params)
+double DSP::GetLoudness() const
 {
-  this->_get_params_(params);
-  this->_apply_input_level_(inputs, num_channels, num_frames, input_gain);
-  this->_ensure_core_dsp_output_ready_();
-  this->_process_core_();
-  this->_apply_output_level_(outputs, num_channels, num_frames, output_gain);
+  if (!HasLoudness())
+  {
+    throw std::runtime_error("Asked for loudness of a model that doesn't know how loud it is!");
+  }
+  return mLoudness;
+}
+
+void DSP::SetLoudness(const double loudness)
+{
+  mLoudness = loudness;
+  mHasLoudness = true;
 }
 
 void DSP::finalize_(const int num_frames) {}
@@ -58,49 +60,10 @@ void DSP::_get_params_(const std::unordered_map<std::string, double>& input_para
   }
 }
 
-void DSP::_apply_input_level_(sample** inputs, const int num_channels, const int num_frames, const double gain)
-{
-  // Must match exactly; we're going to use the size of _input_post_gain later
-  // for num_frames.
-  if (this->_input_post_gain.size() != num_frames)
-    this->_input_post_gain.resize(num_frames);
-  // MONO ONLY
-  const int channel = 0;
-  for (int i = 0; i < num_frames; i++)
-    this->_input_post_gain[i] = float(gain * inputs[channel][i]);
-}
-
-void DSP::_ensure_core_dsp_output_ready_()
-{
-  if (this->_core_dsp_output.size() < this->_input_post_gain.size())
-    this->_core_dsp_output.resize(this->_input_post_gain.size());
-}
-
-void DSP::_process_core_()
-{
-  // Default implementation is the null operation
-  for (int i = 0; i < this->_input_post_gain.size(); i++)
-    this->_core_dsp_output[i] = this->_input_post_gain[i];
-}
-
-void DSP::_apply_output_level_(sample** outputs, const int num_channels, const int num_frames, const double gain)
-{
-  const double loudnessGain = pow(10.0, -(this->mLoudness - TARGET_DSP_LOUDNESS) / 20.0);
-  const double finalGain = this->mNormalizeOutputLoudness ? gain * loudnessGain : gain;
-  for (int c = 0; c < num_channels; c++)
-    for (int s = 0; s < num_frames; s++)
-      outputs[c][s] = double(finalGain * this->_core_dsp_output[s]);
-}
-
 // Buffer =====================================================================
 
-Buffer::Buffer(const int receptive_field)
-: Buffer(TARGET_DSP_LOUDNESS, receptive_field)
-{
-}
-
-Buffer::Buffer(const double loudness, const int receptive_field)
-: DSP(loudness)
+Buffer::Buffer(const int receptive_field, const double expected_sample_rate)
+: DSP(expected_sample_rate)
 {
   this->_set_receptive_field(receptive_field);
 }
@@ -114,34 +77,36 @@ void Buffer::_set_receptive_field(const int new_receptive_field, const int input
 {
   this->_receptive_field = new_receptive_field;
   this->_input_buffer.resize(input_buffer_size);
+  std::fill(this->_input_buffer.begin(), this->_input_buffer.end(), 0.0f);
   this->_reset_input_buffer();
 }
 
-void Buffer::_update_buffers_()
+void Buffer::_update_buffers_(NAM_SAMPLE* input, const int num_frames)
 {
-  const long int num_frames = this->_input_post_gain.size();
   // Make sure that the buffer is big enough for the receptive field and the
   // frames needed!
   {
     const long minimum_input_buffer_size = (long)this->_receptive_field + _INPUT_BUFFER_SAFETY_FACTOR * num_frames;
-    if (this->_input_buffer.size() < minimum_input_buffer_size)
+    if ((long)this->_input_buffer.size() < minimum_input_buffer_size)
     {
       long new_buffer_size = 2;
       while (new_buffer_size < minimum_input_buffer_size)
         new_buffer_size *= 2;
       this->_input_buffer.resize(new_buffer_size);
+      std::fill(this->_input_buffer.begin(), this->_input_buffer.end(), 0.0f);
     }
   }
 
   // If we'd run off the end of the input buffer, then we need to move the data
   // back to the start of the buffer and start again.
-  if (this->_input_buffer_offset + num_frames > this->_input_buffer.size())
+  if (this->_input_buffer_offset + num_frames > (long)this->_input_buffer.size())
     this->_rewind_buffers_();
   // Put the new samples into the input buffer
   for (long i = this->_input_buffer_offset, j = 0; j < num_frames; i++, j++)
-    this->_input_buffer[i] = this->_input_post_gain[j];
+    this->_input_buffer[i] = input[j];
   // And resize the output buffer:
   this->_output_buffer.resize(num_frames);
+  std::fill(this->_output_buffer.begin(), this->_output_buffer.end(), 0.0f);
 }
 
 void Buffer::_rewind_buffers_()
@@ -171,15 +136,11 @@ void Buffer::finalize_(const int num_frames)
 
 // Linear =====================================================================
 
-Linear::Linear(const int receptive_field, const bool _bias, const std::vector<float>& params)
-: Linear(TARGET_DSP_LOUDNESS, receptive_field, _bias, params)
+Linear::Linear(const int receptive_field, const bool _bias, const std::vector<float>& params,
+               const double expected_sample_rate)
+: Buffer(receptive_field, expected_sample_rate)
 {
-}
-
-Linear::Linear(const double loudness, const int receptive_field, const bool _bias, const std::vector<float>& params)
-: Buffer(loudness, receptive_field)
-{
-  if (params.size() != (receptive_field + (_bias ? 1 : 0)))
+  if ((int)params.size() != (receptive_field + (_bias ? 1 : 0)))
     throw std::runtime_error(
       "Params vector does not match expected size based "
       "on architecture parameters");
@@ -191,16 +152,16 @@ Linear::Linear(const double loudness, const int receptive_field, const bool _bia
   this->_bias = _bias ? params[receptive_field] : (float)0.0;
 }
 
-void Linear::_process_core_()
+void Linear::process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames)
 {
-  this->Buffer::_update_buffers_();
+  this->Buffer::_update_buffers_(input, num_frames);
 
   // Main computation!
-  for (long i = 0; i < this->_input_post_gain.size(); i++)
+  for (size_t i = 0; i < num_frames; i++)
   {
-    const long offset = this->_input_buffer_offset - this->_weight.size() + i + 1;
+    const size_t offset = this->_input_buffer_offset - this->_weight.size() + i + 1;
     auto input = Eigen::Map<const Eigen::VectorXf>(&this->_input_buffer[offset], this->_receptive_field);
-    this->_core_dsp_output[i] = this->_bias + this->_weight.dot(input);
+    output[i] = this->_bias + this->_weight.dot(input);
   }
 }
 
@@ -215,10 +176,10 @@ void Conv1D::set_params_(std::vector<float>::iterator& params)
     // Crazy ordering because that's how it gets flattened.
     for (auto i = 0; i < out_channels; i++)
       for (auto j = 0; j < in_channels; j++)
-        for (auto k = 0; k < this->_weight.size(); k++)
+        for (size_t k = 0; k < this->_weight.size(); k++)
           this->_weight[k](i, j) = *(params++);
   }
-  for (int i = 0; i < this->_bias.size(); i++)
+  for (long i = 0; i < this->_bias.size(); i++)
     this->_bias(i) = *(params++);
 }
 
@@ -226,7 +187,7 @@ void Conv1D::set_size_(const int in_channels, const int out_channels, const int 
                        const int _dilation)
 {
   this->_weight.resize(kernel_size);
-  for (int i = 0; i < this->_weight.size(); i++)
+  for (size_t i = 0; i < this->_weight.size(); i++)
     this->_weight[i].resize(out_channels,
                             in_channels); // y = Ax, input array (C,L)
   if (do_bias)
@@ -247,7 +208,7 @@ void Conv1D::process_(const Eigen::MatrixXf& input, Eigen::MatrixXf& output, con
                       const long j_start) const
 {
   // This is the clever part ;)
-  for (long k = 0; k < this->_weight.size(); k++)
+  for (size_t k = 0; k < this->_weight.size(); k++)
   {
     const long offset = this->_dilation * (k + 1 - this->_weight.size());
     if (k == 0)
@@ -262,7 +223,7 @@ void Conv1D::process_(const Eigen::MatrixXf& input, Eigen::MatrixXf& output, con
 long Conv1D::get_num_params() const
 {
   long num_params = this->_bias.size();
-  for (long i = 0; i < this->_weight.size(); i++)
+  for (size_t i = 0; i < this->_weight.size(); i++)
     num_params += this->_weight[i].size();
   return num_params;
 }

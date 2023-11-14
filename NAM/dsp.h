@@ -13,6 +13,14 @@
 #include "json.hpp"
 
 #include "ghc/fs_std_fwd.hpp"
+#ifdef NAM_SAMPLE_FLOAT
+  #define NAM_SAMPLE float
+#else
+  #define NAM_SAMPLE double
+#endif
+// Use a sample rate of -1 if we don't know what the model expects to be run at.
+// TODO clean this up and track a bool for whether it knows.
+#define NAM_UNKNOWN_EXPECTED_SAMPLE_RATE -1.0
 
 enum EArchitectures
 {
@@ -37,27 +45,22 @@ public:
 };
 // And the params shall be provided as a std::vector<DSPParam>.
 
-// How loud do we want the models to be? in dB
-#define TARGET_DSP_LOUDNESS -18.0
-
 class DSP
 {
 public:
-  DSP();
-  DSP(const double loudness);
+  // Older models won't know, but newer ones will come with a loudness from the training based on their response to a
+  // standardized input.
+  // We may choose to have the models figure out for themselves how loud they are in here in the future.
+  DSP(const double expected_sample_rate);
   virtual ~DSP() = default;
-  // process() does all of the processing requried to take `inputs` array and
-  // fill in the required values on `outputs`.
+  // process() does all of the processing requried to take `input` array and
+  // fill in the required values on `output`.
   // To do this:
-  // 1. The parameters from the plugin (I/O levels and any other parametric
-  //    inputs) are gotten.
-  // 2. The input level is applied
-  // 3. The core DSP algorithm is run (This is what should probably be
+  // 1. The core DSP algorithm is run (This is what should probably be
   //    overridden in subclasses).
-  // 4. The output level is applied and the result stored to `output`.
-  virtual void process(sample** inputs, sample** outputs, const int num_channels, const int num_frames,
-                       const double input_gain, const double output_gain,
-                       const std::unordered_map<std::string, double>& params);
+  // 2. The output level is applied and the result stored to `output`.
+  virtual void process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames);
+
   // Anything to take care of before next buffer comes in.
   // For example:
   // * Move the buffer index forward
@@ -65,22 +68,29 @@ public:
   //   that actually uses them, which varies depends on the particulars of the
   //   DSP subclass implementation.
   virtual void finalize_(const int num_frames);
-  void SetNormalize(const bool normalize) { this->mNormalizeOutputLoudness = normalize; };
-  bool HasLoudness() { return mLoudness != TARGET_DSP_LOUDNESS; };
+  // Expected sample rate, in Hz.
+  // TODO throw if it doesn't know.
+  double GetExpectedSampleRate() const { return mExpectedSampleRate; };
+  // Get how loud this model is, in dB.
+  // Throws a std::runtime_error if the model doesn't know how loud it is.
+  double GetLoudness() const;
+  // Get whether the model knows how loud it is.
+  bool HasLoudness() const { return mHasLoudness; };
+  // Set the loudness, in dB.
+  // This is usually defined to be the loudness to a standardized input. The trainer has its own, but you can always
+  // use this to define it a different way if you like yours better.
+  void SetLoudness(const double loudness);
 
 protected:
-  // How loud is the model?
-  double mLoudness;
-  // Should we normalize according to this loudness?
-  bool mNormalizeOutputLoudness;
+  bool mHasLoudness = false;
+  // How loud is the model? In dB
+  double mLoudness = 0.0;
+  // What sample rate does the model expect?
+  double mExpectedSampleRate;
   // Parameters (aka "knobs")
   std::unordered_map<std::string, sample> _params;
   // If the params have changed since the last buffer was processed:
-  bool _stale_params;
-  // Where to store the samples after applying input gain
-  std::vector<float> _input_post_gain;
-  // Location for the output of the core DSP algorithm.
-  std::vector<float> _core_dsp_output;
+  bool _stale_params = true;
 
   // Methods
 
@@ -88,21 +98,6 @@ protected:
   // If anything has changed, then set this->_stale_params to true.
   // (TODO use "listener" approach)
   void _get_params_(const std::unordered_map<std::string, double>& input_params);
-
-  // Apply the input gain
-  // Result populates this->_input_post_gain
-  void _apply_input_level_(sample** inputs, const int num_channels, const int num_frames, const double gain);
-
-  // i.e. ensure the size is correct.
-  void _ensure_core_dsp_output_ready_();
-
-  // The core of your DSP algorithm.
-  // Access the inputs in this->_input_post_gain
-  // Place the outputs in this->_core_dsp_output
-  virtual void _process_core_();
-
-  // Copy this->_core_dsp_output to output and apply the output volume
-  void _apply_output_level_(sample** outputs, const int num_channels, const int num_frames, const double gain);
 };
 
 // Class where an input buffer is kept so that long-time effects can be
@@ -111,8 +106,7 @@ protected:
 class Buffer : public DSP
 {
 public:
-  Buffer(const int receptive_field);
-  Buffer(const double loudness, const int receptive_field);
+  Buffer(const int receptive_field, const double expected_sample_rate = -1.0);
   void finalize_(const int num_frames);
 
 protected:
@@ -128,7 +122,7 @@ protected:
   void _set_receptive_field(const int new_receptive_field);
   void _reset_input_buffer();
   // Use this->_input_post_gain
-  virtual void _update_buffers_();
+  virtual void _update_buffers_(NAM_SAMPLE* input, int num_frames);
   virtual void _rewind_buffers_();
 };
 
@@ -136,9 +130,9 @@ protected:
 class Linear : public Buffer
 {
 public:
-  Linear(const int receptive_field, const bool _bias, const std::vector<float>& params);
-  Linear(const double loudness, const int receptive_field, const bool _bias, const std::vector<float>& params);
-  void _process_core_() override;
+  Linear(const int receptive_field, const bool _bias, const std::vector<float>& params,
+         const double expected_sample_rate = -1.0);
+  void process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames) override;
 
 protected:
   Eigen::VectorXf _weight;
@@ -196,6 +190,21 @@ private:
 // Utilities ==================================================================
 // Implemented in get_dsp.cpp
 
+// Data for a DSP object
+// :param version: Data version. Follows the conventions established in the trainer code.
+// :param architecture: Defines the high-level architecture. Supported are (as per `get-dsp()` in get_dsp.cpp):
+//     * "CatLSTM"
+//     * "CatWaveNet"
+//     * "ConvNet"
+//     * "LSTM"
+//     * "Linear"
+//     * "WaveNet"
+// :param config:
+// :param metadata:
+// :param params: The model parameters ("weights")
+// :param expected_sample_rate: Most NAM models implicitly assume that data will be provided to them at some sample
+//     rate. This captures it for other components interfacing with the model to understand its needs. Use -1.0 for "I
+//     don't know".
 struct dspData
 {
   std::string version;
@@ -203,6 +212,7 @@ struct dspData
   nlohmann::json config;
   nlohmann::json metadata;
   std::vector<float> params;
+  double expected_sample_rate;
 };
 
 // Verify that the config that we are building our model from is supported by

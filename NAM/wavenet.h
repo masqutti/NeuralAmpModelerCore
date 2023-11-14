@@ -23,11 +23,11 @@ class _Layer
 public:
   _Layer(const int condition_size, const int channels, const int kernel_size, const int dilation,
          const std::string activation, const bool gated)
-  : _activation(activations::Activation::get_activation(activation))
-  , _gated(gated)
-  , _conv(channels, gated ? 2 * channels : channels, kernel_size, true, dilation)
+  : _conv(channels, gated ? 2 * channels : channels, kernel_size, true, dilation)
   , _input_mixin(condition_size, gated ? 2 * channels : channels, false)
-  , _1x1(channels, channels, true){};
+  , _1x1(channels, channels, true)
+  , _activation(activations::Activation::get_activation(activation))
+  , _gated(gated){};
   void set_params_(std::vector<float>::iterator& params);
   // :param `input`: from previous layer
   // :param `output`: to next layer
@@ -67,7 +67,7 @@ public:
   , gated(gated_)
   , head_bias(head_bias_)
   {
-    for (int i = 0; i < dilations_.size(); i++)
+    for (size_t i = 0; i < dilations_.size(); i++)
       this->dilations.push_back(dilations_[i]);
   };
 
@@ -168,9 +168,7 @@ class WaveNet : public DSP
 {
 public:
   WaveNet(const std::vector<LayerArrayParams>& layer_array_params, const float head_scale, const bool with_head,
-          nlohmann::json parametric, std::vector<float> params);
-  WaveNet(const double loudness, const std::vector<LayerArrayParams>& layer_array_params, const float head_scale,
-          const bool with_head, nlohmann::json parametric, std::vector<float> params);
+          nlohmann::json parametric, std::vector<float> params, const double expected_sample_rate = -1.0);
 
   //    WaveNet(WaveNet&&) = default;
   //    WaveNet& operator=(WaveNet&&) = default;
@@ -202,18 +200,9 @@ private:
   void _init_parametric_(nlohmann::json& parametric);
   void _prepare_for_frames_(const long num_frames);
   // Reminder: From ._input_post_gain to ._core_dsp_output
-  void _process_core_() override;
+  void process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames) override;
 
   // Ensure that all buffer arrays are the right size for this num_frames
   void _set_num_frames_(const long num_frames);
-
-  // The net starts with random parameters inside; we need to wait for a full
-  // receptive field to pass through before we can count on the output being
-  // ok. This implements a gentle "ramp-up" so that there's no "pop" at the
-  // start.
-  long _anti_pop_countdown;
-  const long _anti_pop_ramp = 4000;
-  void _anti_pop_();
-  void _reset_anti_pop_();
 };
 }; // namespace wavenet

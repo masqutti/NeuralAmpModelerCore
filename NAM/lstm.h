@@ -50,15 +50,13 @@ class LSTM : public DSP
 {
 public:
   LSTM(const int num_layers, const int input_size, const int hidden_size, std::vector<float>& params,
-       nlohmann::json& parametric);
-  LSTM(const double loudness, const int num_layers, const int input_size, const int hidden_size,
-       std::vector<float>& params, nlohmann::json& parametric);
+       nlohmann::json& parametric, const double expected_sample_rate = -1.0);
   ~LSTM() = default;
 
 protected:
   Eigen::VectorXf _head_weight;
   float _head_bias;
-  void _process_core_() override;
+  void process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames) override;
   std::vector<LSTMCell> _layers;
 
   float _process_sample(const float x);

@@ -39,23 +39,33 @@ void lstm::LSTMCell::process_(const Eigen::VectorXf& x)
   const long f_offset = hidden_size;
   const long g_offset = 2 * hidden_size;
   const long o_offset = 3 * hidden_size;
-  for (auto i = 0; i < hidden_size; i++)
-    this->_c[i] = activations::sigmoid(this->_ifgo[i + f_offset]) * this->_c[i]
-                  + activations::sigmoid(this->_ifgo[i + i_offset]) * tanhf(this->_ifgo[i + g_offset]);
   const long h_offset = input_size;
-  for (int i = 0; i < hidden_size; i++)
-    this->_xh[i + h_offset] = activations::sigmoid(this->_ifgo[i + o_offset]) * tanhf(this->_c[i]);
+
+  if (activations::Activation::using_fast_tanh)
+  {
+    for (auto i = 0; i < hidden_size; i++)
+      this->_c[i] =
+        activations::fast_sigmoid(this->_ifgo[i + f_offset]) * this->_c[i]
+        + activations::fast_sigmoid(this->_ifgo[i + i_offset]) * activations::fast_tanh(this->_ifgo[i + g_offset]);
+
+    for (int i = 0; i < hidden_size; i++)
+      this->_xh[i + h_offset] =
+        activations::fast_sigmoid(this->_ifgo[i + o_offset]) * activations::fast_tanh(this->_c[i]);
+  }
+  else
+  {
+    for (auto i = 0; i < hidden_size; i++)
+      this->_c[i] = activations::sigmoid(this->_ifgo[i + f_offset]) * this->_c[i]
+                    + activations::sigmoid(this->_ifgo[i + i_offset]) * tanhf(this->_ifgo[i + g_offset]);
+
+    for (int i = 0; i < hidden_size; i++)
+      this->_xh[i + h_offset] = activations::sigmoid(this->_ifgo[i + o_offset]) * tanhf(this->_c[i]);
+  }
 }
 
 lstm::LSTM::LSTM(const int num_layers, const int input_size, const int hidden_size, std::vector<float>& params,
-                 nlohmann::json& parametric)
-: LSTM(TARGET_DSP_LOUDNESS, num_layers, input_size, hidden_size, params, parametric)
-{
-}
-
-lstm::LSTM::LSTM(const double loudness, const int num_layers, const int input_size, const int hidden_size,
-                 std::vector<float>& params, nlohmann::json& parametric)
-: DSP(loudness)
+                 nlohmann::json& parametric, const double expected_sample_rate)
+: DSP(expected_sample_rate)
 {
   this->_init_parametric(parametric);
   std::vector<float>::iterator it = params.begin();
@@ -85,7 +95,7 @@ void lstm::LSTM::_init_parametric(nlohmann::json& parametric)
   this->_input_and_params.resize(1 + parametric.size()); // TODO amp parameters
 }
 
-void lstm::LSTM::_process_core_()
+void lstm::LSTM::process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames)
 {
   // Get params into the input vector before starting
   if (this->_stale_params)
@@ -95,8 +105,8 @@ void lstm::LSTM::_process_core_()
     this->_stale_params = false;
   }
   // Process samples, placing results in the required output location
-  for (int i = 0; i < this->_input_post_gain.size(); i++)
-    this->_core_dsp_output[i] = this->_process_sample(this->_input_post_gain[i]);
+  for (size_t i = 0; i < num_frames; i++)
+    output[i] = this->_process_sample(input[i]);
 }
 
 float lstm::LSTM::_process_sample(const float x)
@@ -105,7 +115,7 @@ float lstm::LSTM::_process_sample(const float x)
     return x;
   this->_input_and_params(0) = x;
   this->_layers[0].process_(this->_input_and_params);
-  for (int i = 1; i < this->_layers.size(); i++)
+  for (size_t i = 1; i < this->_layers.size(); i++)
     this->_layers[i].process_(this->_layers[i - 1].get_hidden_state());
   return this->_head_weight.dot(this->_layers[this->_layers.size() - 1].get_hidden_state()) + this->_head_bias;
 }
