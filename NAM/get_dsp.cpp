@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <unordered_set>
 
+#include "ghc/fs_std_impl.hpp"
 #include "dsp.h"
 #include "json.hpp"
 #include "lstm.h"

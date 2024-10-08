@@ -1,6 +1,5 @@
 #pragma once
 
-#include <ghc/fs_std_fwd.hpp>
 #include <iterator>
 #include <memory>
 #include <string>
@@ -11,6 +10,7 @@
 
 #include "activations.h"
 #include "json.hpp"
+#include "ghc/fs_std_fwd.hpp"
 
 #ifdef NAM_SAMPLE_FLOAT
   #define NAM_SAMPLE float
