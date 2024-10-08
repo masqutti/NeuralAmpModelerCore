@@ -11,7 +11,8 @@ using std::chrono::milliseconds;
 
 #define AUDIO_BUFFER_SIZE 64
 
-double buffer[AUDIO_BUFFER_SIZE];
+double inputBuffer[AUDIO_BUFFER_SIZE];
+double outputBuffer[AUDIO_BUFFER_SIZE];
 
 int main(int argc, char* argv[])
 {
@@ -22,12 +23,12 @@ int main(int argc, char* argv[])
     std::cout << "Loading model " << modelPath << "\n";
 
     // Turn on fast tanh approximation
-    activations::Activation::enable_fast_tanh();
+    nam::activations::Activation::enable_fast_tanh();
 
-    std::unique_ptr<DSP> model;
+    std::unique_ptr<nam::DSP> model;
 
     model.reset();
-    model = std::move(get_dsp(modelPath));
+    model = std::move(nam::get_dsp(modelPath));
 
     if (model == nullptr)
     {
@@ -36,22 +37,29 @@ int main(int argc, char* argv[])
       exit(1);
     }
 
-    auto t1 = high_resolution_clock::now();
 
-    size_t bufferSize = 64;
-    size_t numBuffers = (48000 / 64) * 2;
+    size_t bufferSize = AUDIO_BUFFER_SIZE;
+    model->Reset(model->GetExpectedSampleRate(), bufferSize);
+    size_t numBuffers = (48000 / bufferSize) * 2;
+
+    // Fill input buffer with zeroes.
+    // Output buffer doesn't matter.
+    for (int i = 0; i < AUDIO_BUFFER_SIZE; i++)
+    {
+      inputBuffer[i] = 0.0;
+    }
+    // Run once outside to trigger any pre-allocation
+    model->process(inputBuffer, outputBuffer, AUDIO_BUFFER_SIZE);
 
     std::cout << "Running benchmark\n";
-
+    auto t1 = high_resolution_clock::now();
     for (size_t i = 0; i < numBuffers; i++)
     {
-      model->process(buffer, buffer, AUDIO_BUFFER_SIZE);
-      model->finalize_(AUDIO_BUFFER_SIZE);
+      model->process(inputBuffer, outputBuffer, AUDIO_BUFFER_SIZE);
     }
-
+    auto t2 = high_resolution_clock::now();
     std::cout << "Finished\n";
 
-    auto t2 = high_resolution_clock::now();
 
     /* Getting number of milliseconds as an integer. */
     auto ms_int = duration_cast<milliseconds>(t2 - t1);

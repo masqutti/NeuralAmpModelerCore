@@ -22,6 +22,8 @@
 // TODO clean this up and track a bool for whether it knows.
 #define NAM_UNKNOWN_EXPECTED_SAMPLE_RATE -1.0
 
+namespace nam
+{
 enum EArchitectures
 {
   kLinear = 0,
@@ -33,18 +35,6 @@ enum EArchitectures
   kNumModels
 };
 
-using sample = float;
-
-// Class for providing params from the plugin to the DSP module
-// For now, we'll work with doubles. Later, we'll add other types.
-class DSPParam
-{
-public:
-  const char* name;
-  const double val;
-};
-// And the params shall be provided as a std::vector<DSPParam>.
-
 class DSP
 {
 public:
@@ -53,6 +43,12 @@ public:
   // We may choose to have the models figure out for themselves how loud they are in here in the future.
   DSP(const double expected_sample_rate);
   virtual ~DSP() = default;
+  // prewarm() does any required intial work required to "settle" model initial conditions
+  // it can be somewhat expensive, so should not be called during realtime audio processing
+  // Important: don't expect the model to be outputting zeroes after this. Neural networks
+  // Don't know that there's anything special about "zero", and forcing this gets rid of
+  // some possibilities that I dont' want to rule out (e.g. models that "are noisy").
+  virtual void prewarm();
   // process() does all of the processing requried to take `input` array and
   // fill in the required values on `output`.
   // To do this:
@@ -61,13 +57,6 @@ public:
   // 2. The output level is applied and the result stored to `output`.
   virtual void process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames);
 
-  // Anything to take care of before next buffer comes in.
-  // For example:
-  // * Move the buffer index forward
-  // * Does NOT say that params aren't stale; that's the job of the routine
-  //   that actually uses them, which varies depends on the particulars of the
-  //   DSP subclass implementation.
-  virtual void finalize_(const int num_frames);
   // Expected sample rate, in Hz.
   // TODO throw if it doesn't know.
   double GetExpectedSampleRate() const { return mExpectedSampleRate; };
@@ -76,6 +65,16 @@ public:
   double GetLoudness() const;
   // Get whether the model knows how loud it is.
   bool HasLoudness() const { return mHasLoudness; };
+  // General function for resetting the DSP unit.
+  // This doesn't call prewarm(). If you want to do that, then you might want to use ResetAndPrewarm().
+  // See https://github.com/sdatkinson/NeuralAmpModelerCore/issues/96 for the reasoning.
+  virtual void Reset(const double sampleRate, const int maxBufferSize);
+  // Reset(), then prewarm()
+  void ResetAndPrewarm(const double sampleRate, const int maxBufferSize)
+  {
+    Reset(sampleRate, maxBufferSize);
+    prewarm();
+  }
   // Set the loudness, in dB.
   // This is usually defined to be the loudness to a standardized input. The trainer has its own, but you can always
   // use this to define it a different way if you like yours better.
@@ -87,17 +86,15 @@ protected:
   double mLoudness = 0.0;
   // What sample rate does the model expect?
   double mExpectedSampleRate;
-  // Parameters (aka "knobs")
-  std::unordered_map<std::string, sample> _params;
-  // If the params have changed since the last buffer was processed:
-  bool _stale_params = true;
 
-  // Methods
+  // Have we been told what the external sample rate is? If so, what is it?
+  bool mHaveExternalSampleRate = false;
+  double mExternalSampleRate = -1.0;
+  // The largest buffer I expect to be told to process:
+  int mMaxBufferSize = 512;
 
-  // Copy the parameters to the DSP module.
-  // If anything has changed, then set this->_stale_params to true.
-  // (TODO use "listener" approach)
-  void _get_params_(const std::unordered_map<std::string, double>& input_params);
+  // How many samples should be processed for me to be considered "warmed up"?
+  virtual int PrewarmSamples() { return 0; };
 };
 
 // Class where an input buffer is kept so that long-time effects can be
@@ -107,7 +104,6 @@ class Buffer : public DSP
 {
 public:
   Buffer(const int receptive_field, const double expected_sample_rate = -1.0);
-  void finalize_(const int num_frames);
 
 protected:
   // Input buffer
@@ -118,6 +114,7 @@ protected:
   std::vector<float> _input_buffer;
   std::vector<float> _output_buffer;
 
+  void _advance_input_buffer_(const int num_frames);
   void _set_receptive_field(const int new_receptive_field, const int input_buffer_size);
   void _set_receptive_field(const int new_receptive_field);
   void _reset_input_buffer();
@@ -130,7 +127,7 @@ protected:
 class Linear : public Buffer
 {
 public:
-  Linear(const int receptive_field, const bool _bias, const std::vector<float>& params,
+  Linear(const int receptive_field, const bool _bias, const std::vector<float>& weights,
          const double expected_sample_rate = -1.0);
   void process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames) override;
 
@@ -141,23 +138,24 @@ protected:
 
 // NN modules =================================================================
 
+// TODO conv could take care of its own ring buffer.
 class Conv1D
 {
 public:
   Conv1D() { this->_dilation = 1; };
-  void set_params_(std::vector<float>::iterator& params);
+  void set_weights_(std::vector<float>::iterator& weights);
   void set_size_(const int in_channels, const int out_channels, const int kernel_size, const bool do_bias,
                  const int _dilation);
-  void set_size_and_params_(const int in_channels, const int out_channels, const int kernel_size, const int _dilation,
-                            const bool do_bias, std::vector<float>::iterator& params);
+  void set_size_and_weights_(const int in_channels, const int out_channels, const int kernel_size, const int _dilation,
+                             const bool do_bias, std::vector<float>::iterator& weights);
   // Process from input to output
-  //  Rightmost indices of input go from i_start to i_end,
-  //  Indices on output for from j_start (to j_start + i_end - i_start)
-  void process_(const Eigen::MatrixXf& input, Eigen::MatrixXf& output, const long i_start, const long i_end,
+  //  Rightmost indices of input go from i_start for ncols,
+  //  Indices on output for from j_start (to j_start + ncols - i_start)
+  void process_(const Eigen::MatrixXf& input, Eigen::MatrixXf& output, const long i_start, const long ncols,
                 const long j_start) const;
   long get_in_channels() const { return this->_weight.size() > 0 ? this->_weight[0].cols() : 0; };
   long get_kernel_size() const { return this->_weight.size(); };
-  long get_num_params() const;
+  long get_num_weights() const;
   long get_out_channels() const { return this->_weight.size() > 0 ? this->_weight[0].rows() : 0; };
   int get_dilation() const { return this->_dilation; };
 
@@ -174,7 +172,7 @@ class Conv1x1
 {
 public:
   Conv1x1(const int in_channels, const int out_channels, const bool _bias);
-  void set_params_(std::vector<float>::iterator& params);
+  void set_weights_(std::vector<float>::iterator& weights);
   // :param input: (N,Cin) or (Cin,)
   // :return: (N,Cout) or (Cout,), respectively
   Eigen::MatrixXf process(const Eigen::MatrixXf& input) const;
@@ -201,7 +199,7 @@ private:
 //     * "WaveNet"
 // :param config:
 // :param metadata:
-// :param params: The model parameters ("weights")
+// :param weights: The model weights
 // :param expected_sample_rate: Most NAM models implicitly assume that data will be provided to them at some sample
 //     rate. This captures it for other components interfacing with the model to understand its needs. Use -1.0 for "I
 //     don't know".
@@ -211,7 +209,7 @@ struct dspData
   std::string architecture;
   nlohmann::json config;
   nlohmann::json metadata;
-  std::vector<float> params;
+  std::vector<float> weights;
   double expected_sample_rate;
 };
 
@@ -226,4 +224,9 @@ std::unique_ptr<DSP> get_dsp(const fs::path model_file, dspData& returnedConfig)
 // Instantiates a DSP object from dsp_config struct.
 std::unique_ptr<DSP> get_dsp(dspData& conf);
 // Legacy loader for directory-type DSPs
+<<<<<<< HEAD
 std::unique_ptr<DSP> get_dsp_legacy(const fs::path dirname);
+=======
+std::unique_ptr<DSP> get_dsp_legacy(const std::filesystem::path dirname);
+}; // namespace nam
+>>>>>>> main
