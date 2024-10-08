@@ -98,8 +98,8 @@ std::unique_ptr<DSP> get_dsp(const fs::path config_filename, dspData& returnedCo
   std::vector<float> weights = GetWeights(j, config_filename);
 
   // Assign values to returnedConfig
-  returnedConfig.version = j["version"];
-  returnedConfig.architecture = j["architecture"];
+  returnedConfig.version = j["version"].get<std::string>();
+  returnedConfig.architecture = j["architecture"].get<std::string>();
   returnedConfig.config = j["config"];
   returnedConfig.metadata = j["metadata"];
   returnedConfig.weights = weights;

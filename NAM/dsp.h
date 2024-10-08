@@ -12,6 +12,7 @@
 #include "json.hpp"
 #include "ghc/fs_std_fwd.hpp"
 
+#include "ghc/fs_std_fwd.hpp"
 #ifdef NAM_SAMPLE_FLOAT
   #define NAM_SAMPLE float
 #else
@@ -55,6 +56,7 @@ public:
   //    overridden in subclasses).
   // 2. The output level is applied and the result stored to `output`.
   virtual void process(NAM_SAMPLE* input, NAM_SAMPLE* output, const int num_frames);
+
   // Expected sample rate, in Hz.
   // TODO throw if it doesn't know.
   double GetExpectedSampleRate() const { return mExpectedSampleRate; };
@@ -84,6 +86,7 @@ protected:
   double mLoudness = 0.0;
   // What sample rate does the model expect?
   double mExpectedSampleRate;
+
   // Have we been told what the external sample rate is? If so, what is it?
   bool mHaveExternalSampleRate = false;
   double mExternalSampleRate = -1.0;
@@ -222,4 +225,5 @@ std::unique_ptr<DSP> get_dsp(const fs::path model_file, dspData& returnedConfig)
 std::unique_ptr<DSP> get_dsp(dspData& conf);
 // Legacy loader for directory-type DSPs
 std::unique_ptr<DSP> get_dsp_legacy(const fs::path dirname);
+
 }; // namespace nam
